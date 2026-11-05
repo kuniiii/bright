@@ -307,10 +307,48 @@ func waitUntil(_ condition: () -> Bool) -> Bool {
 }
 
 // launchd owns the daemon, so it is never a child of the terminal and survives it closing.
-// The plist is outside ~/Library/LaunchAgents, so it does not start at login.
+// This plist is outside ~/Library/LaunchAgents, so on its own it does not start at login.
 let jobLabel = "com.peterkun.bright"
 let jobDomain = "gui/\(getuid())"
 let jobPlist = stateDir + "/\(jobLabel).plist"
+let loginAgentsDir = NSHomeDirectory() + "/Library/LaunchAgents"
+let loginPlist = loginAgentsDir + "/\(jobLabel).plist"
+
+func writeJob(to plist: String) -> Bool {
+    guard let path = Bundle.main.executablePath else { return false }
+    let job: [String: Any] = [
+        "Label": jobLabel,
+        "ProgramArguments": [URL(fileURLWithPath: path).resolvingSymlinksInPath().path, "__daemon"],
+        "RunAtLoad": true,
+        "ProcessType": "Interactive",
+        "LimitLoadToSessionType": "Aqua",
+    ]
+    guard let data = try? PropertyListSerialization.data(fromPropertyList: job, format: .xml, options: 0) else { return false }
+    return (try? data.write(to: URL(fileURLWithPath: plist))) != nil
+}
+
+// Start at login: the setting is simply whether the login plist exists.
+func startsAtLogin() -> Bool {
+    FileManager.default.fileExists(atPath: loginPlist)
+}
+
+func setStartsAtLogin(_ enabled: Bool) -> Bool {
+    if enabled {
+        try? FileManager.default.createDirectory(atPath: loginAgentsDir, withIntermediateDirectories: true)
+        return writeJob(to: loginPlist)
+    }
+    if !startsAtLogin() { return true }
+    return (try? FileManager.default.removeItem(atPath: loginPlist)) != nil
+}
+
+/// Changes the setting, then checks the file on disk before reporting what happened.
+func changeStartsAtLogin(_ enabled: Bool) -> (ok: Bool, message: String) {
+    let before = startsAtLogin()
+    let written = setStartsAtLogin(enabled)
+    guard written, startsAtLogin() == enabled else { return (false, "could not change it") }
+    if before == enabled { return (true, "already \(enabled ? "on" : "off")") }
+    return (true, enabled ? "added: starts at next login" : "removed: won't start at next login")
+}
 
 @discardableResult
 func launchctl(_ arguments: String...) -> Int32 {
@@ -327,17 +365,9 @@ func launchctl(_ arguments: String...) -> Int32 {
 
 func turnOn() -> Bool {
     if daemonPid() != nil { return true }
-    guard let path = Bundle.main.executablePath else { return false }
-    let job: [String: Any] = [
-        "Label": jobLabel,
-        "ProgramArguments": [URL(fileURLWithPath: path).resolvingSymlinksInPath().path, "__daemon"],
-        "RunAtLoad": true,
-        "ProcessType": "Interactive",
-    ]
     try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
-    guard let data = try? PropertyListSerialization.data(fromPropertyList: job, format: .xml, options: 0),
-          (try? data.write(to: URL(fileURLWithPath: jobPlist))) != nil
-    else { return false }
+    guard writeJob(to: jobPlist) else { return false }
+    if startsAtLogin() { _ = writeJob(to: loginPlist) }  // keep the path right if the binary moved
     launchctl("bootout", "\(jobDomain)/\(jobLabel)")  // a job left loaded after a crash blocks bootstrap
     return waitUntil { daemonPid() != nil || launchctl("bootstrap", jobDomain, jobPlist) == 0 && daemonPid() != nil }
         || waitUntil { daemonPid() != nil }
@@ -358,6 +388,7 @@ func printStatus() {
     let running = daemonPid() != nil
     let level = readLevel()
     print("bright: \(running ? "on" : "off"), level \(level)%")
+    print("start at login: \(startsAtLogin() ? "on" : "off")")
     guard let screen = builtInScreen() else {
         print("built-in screen: not active (lid closed?)")
         return
@@ -380,6 +411,9 @@ bright: extra brightness for the built-in XDR screen
   bright toggle      flip on/off
   bright set 0-100   change the level
   bright status      show state and HDR headroom
+  bright login       show whether it starts at login
+  bright login on    start at login
+  bright login off   don't start at login
 """
 
 // MARK: - Terminal panel
@@ -397,19 +431,22 @@ func runPanel() {
     }
 
     let width = 20
+    var notice = ""
     func render() {
         let on = daemonPid() != nil
         let level = readLevel()
         let filled = level * width / 100
         let bar = String(repeating: "█", count: filled) + String(repeating: "░", count: width - filled)
         let state = on ? "\u{1B}[1;33mON \u{1B}[0m" : "\u{1B}[2mOFF\u{1B}[0m"
-        print("\r\u{1B}[2K  bright  \(state)  \(bar)  \(level)%\r\n\r\u{1B}[2K\u{1B}[2m  space on/off   left/right level   q quit\u{1B}[0m\u{1B}[1A\r", terminator: "")
+        let login = startsAtLogin() ? "\u{1B}[1;33mON \u{1B}[0m" : "\u{1B}[2mOFF\u{1B}[0m"
+        print("\r\u{1B}[2K  bright  \(state)  \(bar)  \(level)%\r\n\r\u{1B}[2K  start at login  \(login)  \(notice)\r\n\r\u{1B}[2K\u{1B}[2m  space on/off   left/right level   l login   q quit\u{1B}[0m\u{1B}[2A\r", terminator: "")
         fflush(stdout)
     }
 
     render()
     var byte: UInt8 = 0
     while read(STDIN_FILENO, &byte, 1) == 1 {
+        notice = ""
         switch byte {
         case UInt8(ascii: "q"), 3:
             return
@@ -417,6 +454,8 @@ func runPanel() {
             return
         case UInt8(ascii: " "), 13:
             if daemonPid() != nil { turnOff() } else { _ = turnOn() }
+        case UInt8(ascii: "l"):
+            notice = changeStartsAtLogin(!startsAtLogin()).message
         case 27:  // arrow keys arrive as ESC [ C / ESC [ D
             var sequence = [UInt8](repeating: 0, count: 2)
             _ = read(STDIN_FILENO, &sequence, 2)
@@ -468,6 +507,18 @@ case "set":
     printStatus()
 case "status":
     printStatus()
+case "login":
+    switch arguments.dropFirst().first {
+    case nil:
+        print("start at login: \(startsAtLogin() ? "on" : "off")")
+    case let value? where value == "on" || value == "off":
+        let result = changeStartsAtLogin(value == "on")
+        print("start at login: \(startsAtLogin() ? "on" : "off") (\(result.message))")
+        if !result.ok { exit(1) }
+    default:
+        print(usage)
+        exit(2)
+    }
 default:
     print(usage)
     exit(arguments.first == "help" || arguments.first == "--help" || arguments.first == "-h" ? 0 : 2)

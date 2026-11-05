@@ -6,7 +6,8 @@ MacBook Pro XDR panels keep their top brightness range for HDR content. `bright`
 
 ```
   bright  ON   ████████████████░░░░  80%
-  space on/off   left/right level   q quit
+  start at login  OFF
+  space on/off   left/right level   l login   q quit
 ```
 
 > `bright` is a small rewrite of one technique from [BrightIntosh](https://github.com/niklasr22/BrightIntosh) by Niklas Rousset, which did the hard work of figuring it out. If you want a proper Mac app with a menu bar icon, settings, automation and external display support, use BrightIntosh.
@@ -35,14 +36,17 @@ The compiler signs the build for your own machine, and macOS doesn't quarantine 
 
 | Command | What it does |
 |---|---|
-| `bright` | Opens the small panel: space turns it on or off, left and right change the level, q quits |
+| `bright` | Opens the small panel: space turns it on or off, left and right change the level, l toggles start at login, q quits |
 | `bright on [0-100]` | Turns it on, optionally at a level |
 | `bright off` | Turns it off, and the screen goes straight back to normal |
 | `bright toggle` | Flips on or off |
 | `bright set 0-100` | Changes the level |
-| `bright status` | Shows the state, the level and the HDR headroom |
+| `bright status` | Shows the state, the level, the start-at-login setting and the HDR headroom |
+| `bright login [on\|off]` | Shows or changes whether it starts at login |
 
-It keeps running after you close the terminal. It stops when you run `bright off`, restart or log out. It does not start at login.
+It keeps running after you close the terminal. It stops when you run `bright off`, restart or log out.
+
+Start at login is off until you turn it on. `bright off` only affects the current session, so if the setting is on, `bright` comes back at the next login. macOS may show a notification when you turn it on, and you can also block it in System Settings under General, Login Items.
 
 ## How it works
 
@@ -54,7 +58,7 @@ When you press the brightness keys, dimming fades straight away over 0.2 seconds
 
 `bright off` restores the gamma table. macOS also restored it in testing when the process was force-killed.
 
-It runs as a `launchd` job rather than a child of your terminal, which is why closing the terminal doesn't stop it. The job is loaded for the current session only.
+It runs as a `launchd` job rather than a child of your terminal, which is why closing the terminal doesn't stop it. Start at login adds the same job to `~/Library/LaunchAgents`.
 
 ## Compatibility
 
@@ -77,6 +81,7 @@ It only boosts the built-in screen. MacBook Air and other screens without the XD
 ## Uninstall
 
 ```sh
+bright login off
 bright off
 rm ~/.local/bin/bright
 rm -rf ~/Library/Application\ Support/bright
