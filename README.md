@@ -2,7 +2,7 @@
 
 Extra brightness for the MacBook Pro XDR screen, from your terminal.
 
-MacBook Pro XDR panels keep their top brightness range for HDR content. `bright` makes that range available to everything on screen. It is one Swift file of under 400 lines, and you build it yourself with one command. You don't need an Apple developer account, signing or an App Store download.
+MacBook Pro XDR panels keep their top brightness range for HDR content. `bright` makes that range available to everything on screen. It is one Swift file of under 500 lines, and you build it yourself with one command. You don't need an Apple developer account, signing or an App Store download.
 
 ```
   bright  ON   ████████████████░░░░  80%
@@ -46,13 +46,13 @@ It keeps running after you close the terminal. It stops when you run `bright off
 
 ## How it works
 
-1. A fullscreen, click-through window sits above everything and draws one pixel, stretched to cover the screen.
-2. That pixel's value is above 1.0, which is brighter than standard white. This makes macOS switch the panel into its HDR range.
-3. The window uses a "multiply" filter, so every pixel below it gets multiplied by that value.
+1. A one-pixel window in the corner of the screen draws a value above 1.0, which is brighter than standard white. This makes macOS switch the panel into its HDR range.
+2. `bright` scales the display's gamma table up, so everything on screen uses part of that range.
+3. It follows the HDR headroom macOS reports. On a 14-inch M4 Pro at level 100, the boost measured between 1.3x and 1.5x depending on the brightness setting.
 
-The multiplier never goes above what macOS reports the panel can show at that moment. On a 14-inch M4 Pro at level 100, it is 1.5x.
+When you press the brightness keys, dimming fades straight away over 0.2 seconds. Brightening waits about 1.5 seconds for the panel to settle, then fades the same way.
 
-`bright` never touches gamma tables or system settings. If it quits or crashes, the window disappears and the screen is back to normal.
+`bright off` restores the gamma table. macOS also restored it in testing when the process was force-killed.
 
 It runs as a `launchd` job rather than a child of your terminal, which is why closing the terminal doesn't stop it. The job is loaded for the current session only.
 
@@ -69,7 +69,8 @@ It only boosts the built-in screen. MacBook Air and other screens without the XD
 - **Brightness, not gamut.** Colors look punchier, but the screen can't show any new ones.
 - **Battery and heat.** Running the panel brighter uses more power and makes more heat. Run `bright off` when you don't need it.
 - **Bright highlights.** Parts of the image that are already very bright can lose some detail.
-- **Brightness keys make the screen jump.** With `bright` on, changing brightness with the keys doesn't change smoothly: the screen jumps to its new level. Redrawing at 60 frames a second didn't help, and the cause isn't known yet. To avoid it, run `bright off` before adjusting.
+- **Brightening lags a little.** The boost catches up about 1.5 to 2 seconds after you raise the brightness.
+- **One gamma app at a time.** Don't run `bright` alongside BrightIntosh or other apps that change gamma. They will overwrite each other.
 - **Not tested yet.** I haven't checked how it behaves with screenshots, screen recordings or HDR video.
 - **No automatic retry.** If the boost doesn't appear, run `bright off`, then `bright on`. BrightIntosh handles these failures for you. `bright` doesn't.
 

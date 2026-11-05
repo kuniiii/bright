@@ -1,11 +1,10 @@
 // bright: extra brightness for the built-in XDR screen, from the terminal.
 //
-// Minimal rewrite of the "multiplying overlay" technique from BrightIntosh by
-// Niklas Rousset (https://github.com/niklasr22/BrightIntosh, GPL-3.0), so this
-// file is GPL-3.0 too. A fullscreen, click-through window draws one HDR pixel
-// stretched over the screen with a "multiply" filter. That switches the panel
-// into its HDR range and multiplies everything below it. Gamma is never touched,
-// so quitting or crashing puts the screen straight back to normal.
+// Minimal rewrite of the gamma technique from BrightIntosh by Niklas Rousset
+// (https://github.com/niklasr22/BrightIntosh, GPL-3.0), so this file is GPL-3.0 too.
+// A one-pixel window asks macOS for the panel's HDR range, then the display's gamma
+// table is scaled up so everything on screen uses part of that range. Off and normal
+// quits restore the table. macOS also resets it if the process is killed.
 //
 // Build: swiftc -O bright.swift -o bright
 
@@ -62,19 +61,40 @@ func referenceValues() -> (edr: Double, bonus: Double) {
         : (2.66, 0.50)
 }
 
-/// How much to multiply the screen by. Never above what the panel can show right now,
-/// so highlights are not clipped. Stays just over 1 while HDR is engaging, because
-/// a pixel above 1.0 is what asks macOS for the HDR range in the first place.
-func factor(level: Int, maxEDR: Double) -> Double {
-    if level == 0 { return 1.0 }
+/// BrightIntosh's formula: the more headroom the panel has left, the smaller the boost.
+func factor(level: Int, maxEDR: Double) -> Float {
+    guard maxEDR > 1.05 else { return 1 }  // HDR not active yet, so a boost would only clip
     let (referenceEDR, bonus) = referenceValues()
-    let share = min(maxEDR / referenceEDR, Double(level) / 100)
-    return max(1.12, min(1 + bonus * share, maxEDR))
+    let clamped = min(max(maxEDR, referenceEDR), 16)
+    let full = 1 + bonus * (1 - (clamped - referenceEDR) / (16 - referenceEDR))
+    return Float(1 + (full - 1) * Double(level) / 100)
 }
 
-// MARK: - Overlay daemon
+// MARK: - Gamma
 
-final class Overlay: MTKView, MTKViewDelegate {
+struct Gamma {
+    static let size: UInt32 = 256
+    var red = [CGGammaValue](repeating: 0, count: Int(size))
+    var green = [CGGammaValue](repeating: 0, count: Int(size))
+    var blue = [CGGammaValue](repeating: 0, count: Int(size))
+
+    static func current(_ id: CGDirectDisplayID) -> Gamma? {
+        var table = Gamma()
+        var count: UInt32 = 0
+        let result = CGGetDisplayTransferByTable(id, size, &table.red, &table.green, &table.blue, &count)
+        return result == .success ? table : nil
+    }
+
+    func apply(_ id: CGDirectDisplayID, factor: Float) {
+        let r = red.map { $0 * factor }, g = green.map { $0 * factor }, b = blue.map { $0 * factor }
+        CGSetDisplayTransferByTable(id, Gamma.size, r, g, b)
+    }
+}
+
+// MARK: - HDR trigger
+
+/// One pixel brighter than white in a corner of the screen. It asks macOS for the HDR range.
+final class Trigger: MTKView, MTKViewDelegate {
     private let queue: MTLCommandQueue
 
     init(frame: CGRect, device: MTLDevice, queue: MTLCommandQueue) {
@@ -85,20 +105,15 @@ final class Overlay: MTKView, MTKViewDelegate {
         delegate = self
         colorPixelFormat = .rgba16Float
         colorspace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+        clearColor = MTLClearColorMake(1.6, 1.6, 1.6, 1)
         preferredFramesPerSecond = 5
         guard let layer = layer as? CAMetalLayer else { return }
         layer.wantsExtendedDynamicRangeContent = true
         layer.isOpaque = false
         layer.pixelFormat = .rgba16Float
-        layer.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)  // white * screen = no change
-        layer.compositingFilter = "multiply"
     }
 
     required init(coder: NSCoder) { fatalError("unused") }
-
-    func set(factor: Double) {
-        clearColor = MTLClearColorMake(factor, factor, factor, 1)
-    }
 
     func draw(in view: MTKView) {
         guard let pass = view.currentRenderPassDescriptor,
@@ -114,47 +129,92 @@ final class Overlay: MTKView, MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 }
 
+// MARK: - Daemon
+
 final class Daemon: NSObject, NSApplicationDelegate {
+    private let fadeDuration = 0.2
+    private let settleDelay = 1.5  // brightening waits for the panel's headroom to stop moving
+    private let epsilon: Float = 0.002
+
     private var window: NSWindow?
-    private var overlay: Overlay?
+    private var displayID: CGDirectDisplayID?
+    private var frame = NSRect.zero
+    private var base: Gamma?
     private var level = readLevel()
-    private var signalSource: DispatchSourceSignal?
+    private var applied: Float = 1
+    private var target: Float = 1
+    private var pending: (factor: Float, since: Date)?
+    private var fadeImmediately = true
+    private var fadeTimer: Timer?
+    private var signalSources: [DispatchSourceSignal] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        rebuild()
-        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
+        syncScreen()
+        Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.tick() }
 
-        let center = NotificationCenter.default
-        center.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.rebuild()
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.syncScreen()
         }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.rebuild()
+            self?.syncScreen()
         }
 
         // `bright set N` writes the level file and pokes us with SIGUSR1.
-        signal(SIGUSR1, SIG_IGN)
-        let source = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
-        source.setEventHandler { [weak self] in
+        onSignal(SIGUSR1) { [weak self] in
             self?.level = readLevel()
+            self?.fadeImmediately = true
             self?.tick()
         }
-        source.resume()
-        signalSource = source
+        // `bright off` arrives as SIGTERM.
+        onSignal(SIGTERM) {
+            CGDisplayRestoreColorSyncSettings()
+            exit(0)
+        }
     }
 
-    private func rebuild() {
+    private func onSignal(_ number: Int32, _ handler: @escaping () -> Void) {
+        signal(number, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+        source.setEventHandler(handler: handler)
+        source.resume()
+        signalSources.append(source)
+    }
+
+    /// Screen parameters also change on a plain brightness change, so only rebuild when
+    /// the display itself changed. Rebuilding would drop HDR and make the screen jump.
+    private func syncScreen() {
+        let screen = builtInScreen()
+        let id = screen.flatMap(displayId)
+        if let screen, id == displayID, screen.frame == frame {
+            window?.setFrameOrigin(triggerOrigin(screen))
+            window?.orderFrontRegardless()
+            tick()
+            return
+        }
+
+        fadeTimer?.invalidate()
+        fadeTimer = nil
         window?.orderOut(nil)
         window = nil
-        overlay = nil
-        guard let screen = builtInScreen(),
+        if displayID != nil { CGDisplayRestoreColorSyncSettings() }
+        displayID = nil
+        base = nil
+        applied = 1
+        target = 1
+        pending = nil
+        fadeImmediately = true
+
+        guard let screen, let id,
               let device = MTLCreateSystemDefaultDevice(),
-              let queue = device.makeCommandQueue()
+              let queue = device.makeCommandQueue(),
+              let table = Gamma.current(id)
         else { return }
 
-        let win = NSWindow(contentRect: screen.frame, styleMask: [.borderless, .fullSizeContentView], backing: .buffered, defer: false)
-        win.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
+        let rect = NSRect(origin: triggerOrigin(screen), size: NSSize(width: 1, height: 1))
+        let win = NSWindow(contentRect: rect, styleMask: [], backing: .buffered, defer: false)
+        win.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()) + 1)
         win.collectionBehavior = [.stationary, .canJoinAllSpaces, .ignoresCycle, .fullScreenAuxiliary]
+        win.canHide = false
         win.isOpaque = false
         win.hasShadow = false
         win.backgroundColor = .clear
@@ -162,20 +222,63 @@ final class Daemon: NSObject, NSApplicationDelegate {
         win.isReleasedWhenClosed = false
         win.hidesOnDeactivate = false
         win.animationBehavior = .none
-
-        let view = Overlay(frame: NSRect(origin: .zero, size: screen.frame.size), device: device, queue: queue)
-        view.autoresizingMask = [.width, .height]
-        win.contentView = view
-        win.setFrame(screen.frame, display: true)
+        win.contentView = Trigger(frame: NSRect(x: 0, y: 0, width: 1, height: 1), device: device, queue: queue)
+        win.setFrame(rect, display: true)
         win.orderFrontRegardless()
+
         window = win
-        overlay = view
+        displayID = id
+        frame = screen.frame
+        base = table
         tick()
     }
 
+    private func triggerOrigin(_ screen: NSScreen) -> NSPoint {
+        NSPoint(x: screen.frame.origin.x, y: screen.frame.origin.y + screen.frame.height - 1)
+    }
+
     private func tick() {
-        guard let screen = builtInScreen() else { return }
-        overlay?.set(factor: factor(level: level, maxEDR: Double(screen.maximumExtendedDynamicRangeColorComponentValue)))
+        guard let screen = builtInScreen(), let id = displayID, let base else { return }
+        let want = factor(level: level, maxEDR: Double(screen.maximumExtendedDynamicRangeColorComponentValue))
+        let current = max(applied, target)
+
+        if want > current + epsilon, !fadeImmediately {
+            // Brightening: wait until the target has held still.
+            if let waiting = pending, abs(waiting.factor - want) <= epsilon {
+                if Date().timeIntervalSince(waiting.since) >= settleDelay { fade(to: want, id: id, base: base) }
+            } else {
+                pending = (want, Date())
+            }
+        } else {
+            pending = nil
+            if abs(want - target) > epsilon { fade(to: want, id: id, base: base) }
+            if want > 1 { fadeImmediately = false }
+        }
+
+        // macOS can reset the table on its own, for example after sleep.
+        if fadeTimer == nil, let now = Gamma.current(id), let last = now.red.last, let baseLast = base.red.last,
+           abs(last - baseLast * applied) > 0.01 {
+            base.apply(id, factor: applied)
+        }
+    }
+
+    private func fade(to newTarget: Float, id: CGDirectDisplayID, base: Gamma) {
+        pending = nil
+        target = newTarget
+        fadeTimer?.invalidate()
+        let from = applied
+        let start = Date()
+        fadeTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] timer in
+            guard let self else { return }
+            let progress = min(1, Date().timeIntervalSince(start) / self.fadeDuration)
+            let eased = Float(progress * progress * (3 - 2 * progress))
+            self.applied = from + (newTarget - from) * eased
+            base.apply(id, factor: self.applied)
+            if progress >= 1 {
+                timer.invalidate()
+                self.fadeTimer = nil
+            }
+        }
     }
 }
 
@@ -262,7 +365,9 @@ func printStatus() {
     let maxEDR = Double(screen.maximumExtendedDynamicRangeColorComponentValue)
     let potential = Double(screen.maximumPotentialExtendedDynamicRangeColorComponentValue)
     print(String(format: "HDR headroom now: %.2fx (panel potential %.2fx)", maxEDR, potential))
-    if running { print(String(format: "multiplying the screen by: %.2fx", factor(level: level, maxEDR: maxEDR))) }
+    if running, let id = displayId(screen), let table = Gamma.current(id), let last = table.red.last {
+        print(String(format: "gamma boost now: %.2fx", last))
+    }
     if potential <= 1 { print("This screen has no HDR range, so bright can't do anything here.") }
 }
 
