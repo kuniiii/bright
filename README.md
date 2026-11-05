@@ -2,7 +2,7 @@
 
 Extra brightness for the MacBook Pro XDR screen, from your terminal.
 
-MacBook Pro XDR panels keep their top brightness range for HDR content. `bright` makes that range available to everything on screen. It is one Swift file of under 500 lines, and you build it yourself with one command. You don't need an Apple developer account, signing or an App Store download.
+MacBook Pro XDR panels keep their top brightness range for HDR content. `bright` makes that range available to everything on screen. It is one Swift file of about 500 lines, and you build it yourself with one command. You don't need an Apple developer account, signing or an App Store download.
 
 ```
   bright  ON   ████████████████░░░░  80%
