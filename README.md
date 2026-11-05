@@ -69,6 +69,7 @@ It only boosts the built-in screen. MacBook Air and other screens without the XD
 - **Brightness, not gamut.** Colors look punchier, but the screen can't show any new ones.
 - **Battery and heat.** Running the panel brighter uses more power and makes more heat. Run `bright off` when you don't need it.
 - **Bright highlights.** Parts of the image that are already very bright can lose some detail.
+- **Brightness keys make the screen jump.** With `bright` on, changing brightness with the keys doesn't change smoothly: the screen jumps to its new level. Redrawing at 60 frames a second didn't help, and the cause isn't known yet. To avoid it, run `bright off` before adjusting.
 - **Not tested yet.** I haven't checked how it behaves with screenshots, screen recordings or HDR video.
 - **No automatic retry.** If the boost doesn't appear, run `bright off`, then `bright on`. BrightIntosh handles these failures for you. `bright` doesn't.
 
